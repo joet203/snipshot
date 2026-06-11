@@ -43,17 +43,34 @@ class SnipshotService : LifecycleService() {
         val obs = object : android.os.FileObserver(dir, mask) {
             override fun onEvent(event: Int, path: String?) {
                 if (path == null) return
-                // Filename only; resolve to a MediaStore URI for openInputStream support.
+                // Skip in-progress system writes (".pending-*"); the MOVED_TO event
+                // with the final name will follow once the screenshot is committed.
+                if (path.startsWith(".")) return
                 ServiceStatus.observerFires++
                 ServiceStatus.lastUri = "file:$path"
-                handler.post {
-                    val uri = queryUriForFilename(path) ?: queryLatestScreenshot() ?: return@post
-                    handleNewMedia(uri)
-                }
+                // We know the exact filename, so NEVER fall back to "latest screenshot"
+                // here — that's how a previous screenshot could be shown for this event.
+                // The MediaStore row can lag the file, so retry the filename lookup.
+                resolveFilenameWithRetry(handler, path, RESOLVE_BACKOFFS_MS.size - 1)
             }
         }
         obs.startWatching()
         return obs
+    }
+
+    /**
+     * The FileObserver sees the file before MediaStore has a row for it.
+     * Retry the exact-filename lookup with backoff instead of guessing "latest".
+     */
+    private fun resolveFilenameWithRetry(handler: Handler, name: String, retriesLeft: Int) {
+        handler.postDelayed({
+            val uri = queryUriForFilename(name)
+            when {
+                uri != null -> handleNewMedia(uri)
+                retriesLeft > 0 -> resolveFilenameWithRetry(handler, name, retriesLeft - 1)
+                else -> ServiceStatus.lastDecision = "skip: no MediaStore row for $name after retries"
+            }
+        }, RESOLVE_BACKOFFS_MS[RESOLVE_BACKOFFS_MS.size - 1 - retriesLeft])
     }
 
     private fun queryUriForFilename(name: String): Uri? {
@@ -98,6 +115,15 @@ class SnipshotService : LifecycleService() {
     // Dedup recently-fired URIs (id) and recently-saved-by-us URIs (id).
     private val recentlySeen = linkedMapOf<Long, Long>()           // id -> timeSeenMs
     private val recentlySaved = linkedMapOf<Long, Long>()          // id -> timeSavedMs
+    private val recentlyShown = linkedMapOf<Long, Long>()          // id -> overlayShownAtMs
+
+    // _ID high-water mark at SERVICE START, seeded once and never bumped after.
+    // The no-URI fallback only accepts rows above it, so nothing that existed
+    // before the service started can ever be resurfaced. A dynamic watermark was
+    // rejected: bumping it for row X can strand a still-pending screenshot with
+    // a lower _ID (codex review, v0.1.2). Post-start dedup is handled instead by
+    // recentlyShown (60s) + the 5s DATE_ADDED window + Snipshot_ exclusion.
+    @Volatile private var startMaxId = -1L
 
     override fun onBind(intent: Intent): IBinder? {
         super.onBind(intent)
@@ -132,16 +158,23 @@ class SnipshotService : LifecycleService() {
         handlerThread = HandlerThread("snipshot-observer").also { it.start() }
         val handler = Handler(handlerThread.looper)
 
+        // Seed the _ID high-water mark BEFORE any observer is registered, so
+        // every image that existed at startup is excluded from the fallback.
+        // Both observers dispatch on this handler, so ordering is guaranteed.
+        handler.post {
+            queryMaxImageId()?.let { startMaxId = it }
+        }
+
         observer = object : ContentObserver(handler) {
             override fun onChange(selfChange: Boolean) {
                 ServiceStatus.observerFires++
-                queryLatestScreenshot()?.let { handleNewMedia(it) }
+                queryFreshScreenshots().forEach { handleNewMedia(it) }
             }
 
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 ServiceStatus.observerFires++
                 ServiceStatus.lastUri = uri?.toString() ?: "<null>"
-                if (uri == null) queryLatestScreenshot()?.let { handleNewMedia(it) }
+                if (uri == null) queryFreshScreenshots().forEach { handleNewMedia(it) }
                 else handleNewMedia(uri)
             }
 
@@ -149,7 +182,7 @@ class SnipshotService : LifecycleService() {
                 ServiceStatus.observerFires++
                 ServiceStatus.lastUri = uris.joinToString(",").take(120)
                 if (uris.isEmpty()) {
-                    queryLatestScreenshot()?.let { handleNewMedia(it) }
+                    queryFreshScreenshots().forEach { handleNewMedia(it) }
                 } else {
                     uris.forEach { handleNewMedia(it) }
                 }
@@ -233,6 +266,17 @@ class SnipshotService : LifecycleService() {
                 }
             }
         }
+        // Never show the overlay twice for the same image, no matter which
+        // observer path delivered it (FileObserver fires CREATE + CLOSE_WRITE +
+        // MOVED_TO; ContentObserver fires on insert + IS_PENDING flip).
+        synchronized(recentlyShown) {
+            recentlyShown[id]?.let { shownAt ->
+                if (now - shownAt < 60_000) {
+                    ServiceStatus.lastDecision = "skip: already shown"
+                    return
+                }
+            }
+        }
         synchronized(recentlySeen) {
             recentlySeen[id]?.let { seenAt ->
                 if (now - seenAt < 2_000) {
@@ -293,6 +337,10 @@ class SnipshotService : LifecycleService() {
                 return
             }
 
+            synchronized(recentlyShown) {
+                recentlyShown[id] = now
+                pruneOldEntries(recentlyShown)
+            }
             ServiceStatus.lastDecision = "SHOWING overlay for $name"
             ServiceStatus.lastAcceptedFire = "$name @ ${nowSec}"
             ServiceStatus.overlayAttempts++
@@ -300,26 +348,56 @@ class SnipshotService : LifecycleService() {
         }
     }
 
-    private fun queryLatestScreenshot(): Uri? {
+    /**
+     * Only used by the ContentObserver no-URI path. Returns ALL fresh candidate
+     * rows (capped), not just the newest — if the newest was already shown, a
+     * just-committed older one must still be inspected. handleNewMedia dedups.
+     * Anchored on _ID above the service-start high-water mark, plus a freshness
+     * window and own-output exclusion. Pending rows are excluded by MediaStore.
+     */
+    private fun queryFreshScreenshots(): List<Uri> {
         return runCatching {
             val projection = arrayOf(MediaStore.Images.Media._ID)
-            // Freshness filter: without it, this fallback could return the PREVIOUS
-            // screenshot when the new file isn't in MediaStore yet.
             val selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ? AND " +
-                "${MediaStore.Images.Media.DATE_ADDED} >= ?"
-            val args = arrayOf("%Screenshots%", (System.currentTimeMillis() / 1000 - 15).toString())
+                "${MediaStore.Images.Media.DATE_ADDED} >= ? AND " +
+                "${MediaStore.Images.Media.DISPLAY_NAME} NOT LIKE ? AND " +
+                "${MediaStore.Images.Media._ID} > ?"
+            val args = arrayOf(
+                "%Screenshots%",
+                (System.currentTimeMillis() / 1000 - 5).toString(),
+                "Snipshot_%",
+                startMaxId.toString()
+            )
             val sort = "${MediaStore.Images.Media.DATE_ADDED} DESC"
             contentResolver.query(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                 projection, selection, args, sort
             )?.use { c ->
-                if (!c.moveToFirst()) return@use null
-                android.content.ContentUris.withAppendedId(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0)
-                )
-            }
+                val uris = mutableListOf<Uri>()
+                while (c.moveToNext() && uris.size < 5) {
+                    uris.add(
+                        android.content.ContentUris.withAppendedId(
+                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0)
+                        )
+                    )
+                }
+                uris
+            } ?: emptyList()
         }.onFailure {
-            android.util.Log.w("Snipshot", "queryLatestScreenshot failed: ${it.message}")
+            android.util.Log.w("Snipshot", "queryFreshScreenshots failed: ${it.message}")
+        }.getOrDefault(emptyList())
+    }
+
+    private fun queryMaxImageId(): Long? {
+        return runCatching {
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Images.Media._ID),
+                null, null,
+                "${MediaStore.Images.Media._ID} DESC"
+            )?.use { c -> if (c.moveToFirst()) c.getLong(0) else null }
+        }.onFailure {
+            android.util.Log.w("Snipshot", "queryMaxImageId failed: ${it.message}")
         }.getOrNull()
     }
 
@@ -367,6 +445,8 @@ class SnipshotService : LifecycleService() {
 
     companion object {
         private const val NOTIF_ID = 1001
+        // First entry is the initial delay before the first lookup attempt.
+        private val RESOLVE_BACKOFFS_MS = longArrayOf(0, 150, 350, 700, 1200)
 
         /** @return null on success, error message on failure. */
         fun start(context: Context): String? {

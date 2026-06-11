@@ -43,6 +43,7 @@ These are real bugs that bit us during development. Each is fixed in the current
 9. **R8 minification requires explicit `-keep` rules** for `androidx.compose.runtime.**`, `androidx.compose.ui.**`, and `com.jt.snipshot.**` — see `proguard-rules.pro`.
 10. **Use formula `openjdk@17`, not cask `temurin@17`** — cask needs sudo password we couldn't provide non-interactively.
 11. **Android 15+ forbids starting a `dataSync` FGS from `BOOT_COMPLETED`** — it throws `ForegroundServiceStartNotAllowedException`, which `onCreate`'s catch turns into a silent stop. `BootReceiver` direct-starts only on SDK < 35; on 35+ it posts a tap-to-resume notification that routes through `MainActivity` (`EXTRA_AUTO_START`), which can start the FGS from foreground.
+12. **Never guess "latest screenshot" from an observer event.** Took 4 codex review rounds to get right (v0.1.2). The FileObserver path retries the exact-filename lookup with backoff (never falls back to latest). The ContentObserver no-URI fallback (`queryFreshScreenshots`) returns ALL fresh candidates (cap 5), each run through `handleNewMedia`'s dedup chain, anchored on a SEED-ONLY `_ID` watermark (`startMaxId`, set once at service start). A dynamic watermark was rejected — bumping it for row X strands a still-pending screenshot with a lower `_ID`. A single-row fallback was rejected — a just-committed B hides behind an already-shown newer A.
 
 ## Diagnostic story
 
