@@ -303,8 +303,11 @@ class SnipshotService : LifecycleService() {
     private fun queryLatestScreenshot(): Uri? {
         return runCatching {
             val projection = arrayOf(MediaStore.Images.Media._ID)
-            val selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
-            val args = arrayOf("%Screenshots%")
+            // Freshness filter: without it, this fallback could return the PREVIOUS
+            // screenshot when the new file isn't in MediaStore yet.
+            val selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ? AND " +
+                "${MediaStore.Images.Media.DATE_ADDED} >= ?"
+            val args = arrayOf("%Screenshots%", (System.currentTimeMillis() / 1000 - 15).toString())
             val sort = "${MediaStore.Images.Media.DATE_ADDED} DESC"
             contentResolver.query(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
@@ -398,7 +401,7 @@ object ServiceStatus {
 
 /** Cropper notifies us about its own MediaStore writes so we can skip them. */
 object SelfWriteTracker {
-    private var listener: ((Long) -> Unit)? = null
+    @Volatile private var listener: ((Long) -> Unit)? = null
     fun attach(l: (Long) -> Unit) { listener = l }
     fun detach() { listener = null }
     fun notifySaved(id: Long) { listener?.invoke(id) }

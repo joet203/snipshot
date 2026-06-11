@@ -3,4 +3,7 @@
     <string name="app_name">Snipshot</string>
     <string name="notif_channel">Snipshot Service</string>
     <string name="notif_title">Snipshot watching for screenshots</string>
+    <string name="notif_resume_channel">Resume after reboot</string>
+    <string name="notif_resume_title">Snipshot stopped after reboot</string>
+    <string name="notif_resume_text">Tap to resume watching for screenshots</string>
 </resources>

@@ -42,6 +42,7 @@ These are real bugs that bit us during development. Each is fixed in the current
 8. **The `current != null` "already showing" guard in `OverlayManager` can permanently block new screenshots** if the previous overlay's dismiss callback never fires. There's a 15-second stale timeout that force-clears; do not remove it.
 9. **R8 minification requires explicit `-keep` rules** for `androidx.compose.runtime.**`, `androidx.compose.ui.**`, and `com.jt.snipshot.**` — see `proguard-rules.pro`.
 10. **Use formula `openjdk@17`, not cask `temurin@17`** — cask needs sudo password we couldn't provide non-interactively.
+11. **Android 15+ forbids starting a `dataSync` FGS from `BOOT_COMPLETED`** — it throws `ForegroundServiceStartNotAllowedException`, which `onCreate`'s catch turns into a silent stop. `BootReceiver` direct-starts only on SDK < 35; on 35+ it posts a tap-to-resume notification that routes through `MainActivity` (`EXTRA_AUTO_START`), which can start the FGS from foreground.
 
 ## Diagnostic story
 

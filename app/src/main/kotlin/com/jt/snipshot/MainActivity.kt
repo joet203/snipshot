@@ -28,11 +28,36 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        maybeAutoStart(intent)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface { SettingsScreen() }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        maybeAutoStart(intent)
+    }
+
+    // Boot-resume notification path: Android 15+ can't start a dataSync FGS from
+    // BOOT_COMPLETED, so BootReceiver routes the user here and we start from foreground.
+    private fun maybeAutoStart(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_AUTO_START, false) != true) return
+        intent.removeExtra(EXTRA_AUTO_START)
+        getSystemService(android.app.NotificationManager::class.java)
+            ?.cancel(BootReceiver.NOTIF_ID_RESUME)
+        val err = SnipshotService.start(this)
+        Toast.makeText(
+            this,
+            if (err == null) "Snipshot resumed" else "Resume failed: $err",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    companion object {
+        const val EXTRA_AUTO_START = "auto_start"
     }
 }
 
@@ -66,6 +91,22 @@ fun SettingsScreen() {
     val notifLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted -> hasNotif = granted }
+
+    // Live-refresh diagnostics while the debug panel is open; otherwise the
+    // numbers freeze at whatever they were on last ON_RESUME.
+    LaunchedEffect(showDebug) {
+        while (showDebug) {
+            serviceRunning = ServiceStatus.isRunning
+            serviceError = ServiceStatus.lastError
+            observerFires = ServiceStatus.observerFires
+            lastUri = ServiceStatus.lastUri
+            lastDecision = ServiceStatus.lastDecision
+            lastAcceptedFire = ServiceStatus.lastAcceptedFire
+            overlayAttempts = ServiceStatus.overlayAttempts
+            overlayResult = ServiceStatus.overlayResult
+            kotlinx.coroutines.delay(1000)
+        }
+    }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->

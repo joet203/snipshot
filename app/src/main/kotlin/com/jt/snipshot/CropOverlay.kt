@@ -78,6 +78,11 @@ fun CropOverlay(
 
     if (image == null) {
         val errMsg = decodeError
+        // Never strand the user on the loading/error screen — auto-dismiss.
+        LaunchedEffect(errMsg) {
+            delay(if (errMsg == null) 15_000L else 10_000L)
+            onCancel()
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -120,8 +125,11 @@ fun CropOverlay(
     }
 
     var antsPhase by remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(dragStart, dragCurrent) {
-        while (dragStart != null && dragCurrent != null) {
+    // Key on the boolean, not the offsets — keying on dragCurrent would cancel and
+    // relaunch this coroutine on every finger move.
+    val dragging = dragStart != null && dragCurrent != null
+    LaunchedEffect(dragging) {
+        while (dragging) {
             antsPhase = (antsPhase + 2f) % 20f
             delay(60)
         }
@@ -136,6 +144,7 @@ fun CropOverlay(
                 if (dragStart != null) {
                     dragStart = null
                     dragCurrent = null
+                    userInteracted = false
                 }
             }
             .pointerInput(Unit) {
@@ -175,6 +184,8 @@ fun CropOverlay(
                     onDragCancel = {
                         dragStart = null
                         dragCurrent = null
+                        // Restart the countdown so a cancelled drag can't strand the overlay.
+                        userInteracted = false
                     }
                 )
             }
