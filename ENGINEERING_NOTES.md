@@ -1,10 +1,12 @@
-# CLAUDE.md — Snipshot
+# Engineering Notes — Snipshot
+
+> Working notes kept during development (originally the project's agent-context file). The "hard-earned gotchas" section documents real Android 14/15/16 bugs hit and fixed.
 
 Project-specific notes for future Claude sessions. Global preferences live at `~/CLAUDE.md`.
 
 ## Goal
 
-Sideloaded Android app on Pixel 10 Fold Pro (JT) and Pixel 8 (his mom). Auto-detects screenshots, shows a marching-ants crop overlay, tap-to-keep-full / drag-to-crop. Not for the Play Store.
+Sideloaded Android app on Pixel devices. Auto-detects screenshots, shows a marching-ants crop overlay, tap-to-keep-full / drag-to-crop. Not for the Play Store.
 
 ## Build environment
 
@@ -16,17 +18,8 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 export PATH="$JAVA_HOME/bin:$PATH"
 ```
 
-Then `./gradlew assembleDebug testDebugUnitTest` from `/Users/jt/ss/snipshot/`.
+Then `./gradlew assembleDebug testDebugUnitTest` from `<repo-root>/`.
 
-## Distribution to phone (already wired up)
-
-Drive remote configured in rclone as `snipshot-drive`. To ship a new build:
-
-```bash
-rclone copyto app/build/outputs/apk/debug/app-debug.apk snipshot-drive:snipshot-debug.apk
-```
-
-Drive link is **persistent** across re-uploads: https://drive.google.com/open?id=17HYLnXa008XWF0nWpRuIZVnc55100-2n — overwriting the file in place keeps the link valid. JT and his mom only need to re-download to get the latest.
 
 ## Hard-earned gotchas (do not re-learn)
 
@@ -59,7 +52,7 @@ Codex is the primary review loop. Standard invocation when reviewing changes:
 ```bash
 codex exec --sandbox workspace-write --skip-git-repo-check \
   -o /tmp/codex-review.md \
-  -C /Users/jt/ss/snipshot "<prompt>"
+  -C <repo-root> "<prompt>"
 ```
 
 `--skip-git-repo-check` is mandatory — without it codex hangs on a stdin trust prompt forever. Codex caught 11+ real bugs during development that source-only review missed.
@@ -70,7 +63,7 @@ codex exec --sandbox workspace-write --skip-git-repo-check \
 
 ## What's NOT in scope (deferred)
 
-- Corner handles for refining the crop rectangle after initial drag (codex flagged it; JT preferred to ship the simple tap/drag UX first)
+- Corner handles for refining the crop rectangle after initial drag (codex flagged it; the maintainer preferred to ship the simple tap/drag UX first)
 - Quick Settings tile for one-tap toggle
 - Refined-after-drag UX (drag-to-move the box, drag corner handles)
 - Play Store distribution (sideload-only by design)

@@ -4,6 +4,15 @@ Auto-crop screenshots on Pixel. The moment a screenshot is captured, a marching-
 
 Sideload-only — designed for personal Pixel devices, not Play Store.
 
+## Demo
+
+> _Demo GIF coming soon — recorded on-device (`adb screenrecord`): screenshot captured → marching-ants overlay → drag-crop → saved._
+
+<!-- ![Snipshot demo](docs/demo.gif) -->
+<!-- ![Overlay](docs/overlay.png) ![Settings](docs/settings.png) -->
+
+For the deep technical story — the Android 14/15/16 bugs hit and fixed during development — see **[ENGINEERING_NOTES.md](ENGINEERING_NOTES.md)**.
+
 ## What's in the box
 
 - Kotlin + Jetpack Compose, ~1300 LOC
