@@ -28,36 +28,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        maybeAutoStart(intent)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface { SettingsScreen() }
             }
         }
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        maybeAutoStart(intent)
-    }
-
-    // Boot-resume notification path: Android 15+ can't start a dataSync FGS from
-    // BOOT_COMPLETED, so BootReceiver routes the user here and we start from foreground.
-    private fun maybeAutoStart(intent: Intent?) {
-        if (intent?.getBooleanExtra(EXTRA_AUTO_START, false) != true) return
-        intent.removeExtra(EXTRA_AUTO_START)
-        getSystemService(android.app.NotificationManager::class.java)
-            ?.cancel(BootReceiver.NOTIF_ID_RESUME)
-        val err = SnipshotService.start(this)
-        Toast.makeText(
-            this,
-            if (err == null) "Snipshot resumed" else "Resume failed: $err",
-            Toast.LENGTH_SHORT
-        ).show()
-    }
-
-    companion object {
-        const val EXTRA_AUTO_START = "auto_start"
     }
 }
 
@@ -72,9 +47,9 @@ fun SettingsScreen() {
     var crashLog by remember { mutableStateOf(CrashLogger.read(context)) }
     var hasOverlay by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     var hasMedia by remember { mutableStateOf(PermissionHelpers.hasMediaImages(context)) }
-    var hasNotif by remember { mutableStateOf(PermissionHelpers.hasPostNotifications(context)) }
     var hasAllFiles by remember { mutableStateOf(PermissionHelpers.hasAllFilesAccess()) }
-    var serviceRunning by remember { mutableStateOf(ServiceStatus.isRunning) }
+    var batteryUnrestricted by remember { mutableStateOf(PermissionHelpers.isBatteryUnrestricted(context)) }
+    var serviceRunning by remember { mutableStateOf(ScreenshotWatcher.isActive(context)) }
     var serviceError by remember { mutableStateOf(ServiceStatus.lastError) }
     var observerFires by remember { mutableIntStateOf(ServiceStatus.observerFires) }
     var lastUri by remember { mutableStateOf(ServiceStatus.lastUri) }
@@ -88,15 +63,11 @@ fun SettingsScreen() {
         ActivityResultContracts.RequestPermission()
     ) { granted -> hasMedia = granted }
 
-    val notifLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted -> hasNotif = granted }
-
     // Live-refresh diagnostics while the debug panel is open; otherwise the
     // numbers freeze at whatever they were on last ON_RESUME.
     LaunchedEffect(showDebug) {
         while (showDebug) {
-            serviceRunning = ServiceStatus.isRunning
+            serviceRunning = ScreenshotWatcher.isActive(context)
             serviceError = ServiceStatus.lastError
             observerFires = ServiceStatus.observerFires
             lastUri = ServiceStatus.lastUri
@@ -113,9 +84,9 @@ fun SettingsScreen() {
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasOverlay = Settings.canDrawOverlays(context)
                 hasMedia = PermissionHelpers.hasMediaImages(context)
-                hasNotif = PermissionHelpers.hasPostNotifications(context)
                 hasAllFiles = PermissionHelpers.hasAllFilesAccess()
-                serviceRunning = ServiceStatus.isRunning
+                batteryUnrestricted = PermissionHelpers.isBatteryUnrestricted(context)
+                serviceRunning = ScreenshotWatcher.isActive(context)
                 serviceError = ServiceStatus.lastError
                 observerFires = ServiceStatus.observerFires
                 lastUri = ServiceStatus.lastUri
@@ -186,15 +157,6 @@ fun SettingsScreen() {
             onRequest = { mediaLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES) }
         )
         PermissionRow(
-            label = "Post notifications",
-            granted = hasNotif,
-            onRequest = {
-                if (Build.VERSION.SDK_INT >= 33) {
-                    notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                }
-            }
-        )
-        PermissionRow(
             label = "Draw over other apps",
             granted = hasOverlay,
             onRequest = {
@@ -203,6 +165,24 @@ fun SettingsScreen() {
                     Uri.parse("package:${context.packageName}")
                 )
                 context.startActivity(intent)
+            }
+        )
+        PermissionRow(
+            label = "Unrestricted battery (recommended — so the overlay isn't delayed)",
+            granted = batteryUnrestricted,
+            onRequest = {
+                val intent = Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:${context.packageName}")
+                )
+                runCatching { context.startActivity(intent) }.onFailure {
+                    // Some OEMs reject the direct dialog — fall back to the settings list.
+                    runCatching {
+                        context.startActivity(
+                            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                        )
+                    }
+                }
             }
         )
         PermissionRow(
@@ -315,13 +295,13 @@ fun SettingsScreen() {
 
         Spacer(Modifier.height(8.dp))
 
-        val ready = hasMedia && hasOverlay && hasNotif && (keepOriginal || hasAllFiles)
+        val ready = hasMedia && hasOverlay && (keepOriginal || hasAllFiles)
         Button(
             onClick = {
-                val err = SnipshotService.start(context)
+                val err = ScreenshotWatcher.start(context)
                 if (err == null) {
                     serviceRunning = true
-                    Toast.makeText(context, "Service start requested", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Watching for screenshots", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(context, "Start failed: $err", Toast.LENGTH_LONG).show()
                 }
@@ -332,9 +312,9 @@ fun SettingsScreen() {
 
         OutlinedButton(
             onClick = {
-                SnipshotService.stop(context)
+                ScreenshotWatcher.stop(context)
                 serviceRunning = false
-                Toast.makeText(context, "Service stopped", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Stopped watching", Toast.LENGTH_SHORT).show()
             },
             modifier = Modifier.fillMaxWidth()
         ) { Text("Stop") }
