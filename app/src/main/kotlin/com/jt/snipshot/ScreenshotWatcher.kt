@@ -36,7 +36,13 @@ import android.util.Log
 object ScreenshotWatcher {
 
     private const val TAG = "Snipshot/Watcher"
-    private const val JOB_ID = 7001
+
+    // TWO job ids, used alternately. JobScheduler.schedule() with the id of a
+    // CURRENTLY RUNNING job stops that job (documented in the SDK javadoc), so a
+    // fired job must arm the OTHER id — that keeps a trigger registered for the
+    // whole time the current batch is being processed, with no self-stop.
+    private const val JOB_ID_A = 7001
+    private const val JOB_ID_B = 7002
 
     private const val PREFS = "snipshot_watcher"
     private const val KEY_ENABLED = "watching_enabled"
@@ -53,22 +59,35 @@ object ScreenshotWatcher {
 
     // _ID high-water mark captured when watching is (re)started. The no-URI fallback
     // only accepts rows above it, so nothing that existed at start can be resurfaced.
-    // Seeded once, never bumped after — see CLAUDE.md gotcha #12.
+    // Seeded once, never bumped after — see ENGINEERING_NOTES.md gotcha #12.
     @Volatile private var startMaxId = -1L
     @Volatile private var selfWriteAttached = false
 
+    // In-memory mirror of KEY_ENABLED, so in-flight work and overlay posts can bail
+    // the instant the user hits Stop (canceling the jobs doesn't stop posted work).
+    @Volatile private var enabled: Boolean? = null
+
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    private fun isEnabled(context: Context): Boolean =
+        enabled ?: prefs(context).getBoolean(KEY_ENABLED, false).also { enabled = it }
 
     /** @return null on success, error message on failure. */
     fun start(context: Context): String? {
         val app = context.applicationContext
         return try {
             val maxId = queryMaxImageId(app) ?: -1L
+            // Reset to a known single-trigger state before arming.
+            app.getSystemService(JobScheduler::class.java)?.cancel(JOB_ID_B)
+            if (!scheduleJob(app, JOB_ID_A)) {
+                ServiceStatus.lastError = "JobScheduler rejected the watch job"
+                return "JobScheduler rejected the watch job"
+            }
             prefs(app).edit().putBoolean(KEY_ENABLED, true).putLong(KEY_MAX_ID, maxId).apply()
+            enabled = true
             startMaxId = maxId
             ensureSelfWriteAttached()
-            scheduleJob(app)
             ServiceStatus.isRunning = true
             ServiceStatus.lastError = null
             null
@@ -82,7 +101,11 @@ object ScreenshotWatcher {
     fun stop(context: Context) {
         val app = context.applicationContext
         prefs(app).edit().putBoolean(KEY_ENABLED, false).apply()
-        app.getSystemService(JobScheduler::class.java)?.cancel(JOB_ID)
+        enabled = false
+        app.getSystemService(JobScheduler::class.java)?.let {
+            it.cancel(JOB_ID_A)
+            it.cancel(JOB_ID_B)
+        }
         ServiceStatus.isRunning = false
         mainHandler.post { OverlayManager.dismiss() }
     }
@@ -91,22 +114,39 @@ object ScreenshotWatcher {
     fun resumeIfEnabled(context: Context) {
         val app = context.applicationContext
         if (!prefs(app).getBoolean(KEY_ENABLED, false)) return
+        enabled = true
         startMaxId = prefs(app).getLong(KEY_MAX_ID, -1L)
         ensureSelfWriteAttached()
-        scheduleJob(app)
+        if (!scheduleJob(app, JOB_ID_A)) {
+            ServiceStatus.lastError = "boot re-arm: JobScheduler rejected the watch job"
+            return
+        }
         ServiceStatus.isRunning = true
     }
 
     fun isActive(context: Context): Boolean =
-        context.getSystemService(JobScheduler::class.java)?.getPendingJob(JOB_ID) != null
+        context.getSystemService(JobScheduler::class.java)?.let {
+            it.getPendingJob(JOB_ID_A) != null || it.getPendingJob(JOB_ID_B) != null
+        } ?: false
 
-    /** Re-schedule the one-shot content trigger. Called by the job itself on each fire. */
-    fun rearm(context: Context) = scheduleJob(context.applicationContext)
+    /**
+     * Arm the trigger under the OTHER job id than the one that just fired. Called
+     * from onStartJob BEFORE processing, so a trigger is registered for changes that
+     * land while this batch is handled. Never call with the running job's own id —
+     * schedule() on a running id stops that job.
+     */
+    fun armNext(context: Context, firedJobId: Int) {
+        val next = if (firedJobId == JOB_ID_A) JOB_ID_B else JOB_ID_A
+        if (!scheduleJob(context.applicationContext, next)) {
+            ServiceStatus.lastError = "armNext: JobScheduler rejected job $next"
+        }
+    }
 
-    private fun scheduleJob(context: Context) {
-        val js = context.getSystemService(JobScheduler::class.java) ?: return
+    /** @return true when the job was accepted (RESULT_SUCCESS). */
+    private fun scheduleJob(context: Context, jobId: Int): Boolean {
+        val js = context.getSystemService(JobScheduler::class.java) ?: return false
         val info = JobInfo.Builder(
-            JOB_ID,
+            jobId,
             ComponentName(context, ScreenshotJobService::class.java)
         )
             .addTriggerContentUri(
@@ -118,8 +158,9 @@ object ScreenshotWatcher {
             .setTriggerContentUpdateDelay(TRIGGER_UPDATE_DELAY_MS)
             .setTriggerContentMaxDelay(TRIGGER_MAX_DELAY_MS)
             .build()
-        runCatching { js.schedule(info) }
-            .onFailure { Log.e(TAG, "schedule failed: ${it.message}", it) }
+        return runCatching { js.schedule(info) == JobScheduler.RESULT_SUCCESS }
+            .onFailure { Log.e(TAG, "schedule($jobId) failed: ${it.message}", it) }
+            .getOrDefault(false)
     }
 
     /**
@@ -130,28 +171,49 @@ object ScreenshotWatcher {
     fun onJobFired(context: Context, params: JobParameters, done: () -> Unit) {
         workHandler.post {
             try {
+                if (!isEnabled(context)) {
+                    // stop() raced with an in-flight fire; onStartJob already armed the
+                    // next trigger, so cancel BOTH ids again to leave nothing behind.
+                    context.getSystemService(JobScheduler::class.java)?.let {
+                        it.cancel(JOB_ID_A)
+                        it.cancel(JOB_ID_B)
+                    }
+                    return@post
+                }
                 if (startMaxId < 0) startMaxId = prefs(context).getLong(KEY_MAX_ID, -1L)
                 ensureSelfWriteAttached()
                 ServiceStatus.isRunning = true
                 ServiceStatus.observerFires++
 
-                val uris = params.triggeredContentUris
-                val itemUris = uris?.filter { it.lastPathSegment?.toLongOrNull() != null }
-                if (!itemUris.isNullOrEmpty()) {
-                    ServiceStatus.lastUri = itemUris.joinToString(",").take(120)
-                    itemUris.forEach { handleNewMedia(context, it) }
+                val itemUris = params.triggeredContentUris
+                    ?.filter { it.lastPathSegment?.toLongOrNull() != null }
+                    .orEmpty()
+                ServiceStatus.lastUri = if (itemUris.isNotEmpty()) {
+                    itemUris.joinToString(",").take(120)
                 } else {
-                    // Authorities-only (>50 changes) or a bare directory URI — fall back
-                    // to a fresh-screenshot scan anchored on the start high-water mark.
-                    val auth = params.triggeredContentAuthorities?.joinToString() ?: "<none>"
-                    ServiceStatus.lastUri = "<authorities: $auth>"
-                    queryFreshScreenshots(context).forEach { handleNewMedia(context, it) }
+                    // Authorities-only (>50 changes collapsed) or a bare directory URI.
+                    "<authorities: ${params.triggeredContentAuthorities?.joinToString() ?: "<none>"}>"
                 }
+                itemUris.forEach { handleNewMedia(context, it) }
+
+                // Always sweep after the batch: covers the >50-change collapse, the ms
+                // gap before armNext registered, and anything (e.g. an IS_PENDING flip)
+                // that landed while this batch was processing. handleNewMedia dedups.
+                queryFreshScreenshots(context).forEach { handleNewMedia(context, it) }
             } catch (t: Throwable) {
                 Log.e(TAG, "onJobFired threw: ${t.message}", t)
                 ServiceStatus.lastDecision = "CRASH: ${t.javaClass.simpleName}: ${t.message}"
             } finally {
-                done()
+                // Self-heal: if armNext was rejected (job quota, throttling), no trigger
+                // is pending now — retry the OTHER id (never the running job's own id).
+                if (isEnabled(context) && !isActive(context)) {
+                    val other = if (params.jobId == JOB_ID_A) JOB_ID_B else JOB_ID_A
+                    scheduleJob(context, other)
+                }
+                // Overlay show()s were posted to mainHandler above; routing done() through
+                // the same handler guarantees the overlay window is attached before
+                // jobFinished() releases the job's process-priority guarantee.
+                mainHandler.post { done() }
             }
         }
     }
@@ -276,7 +338,9 @@ object ScreenshotWatcher {
             ServiceStatus.lastAcceptedFire = "$name @ ${nowSec}"
             ServiceStatus.overlayAttempts++
             val appCtx = context.applicationContext
-            mainHandler.post { OverlayManager.show(appCtx, uri) }
+            // Re-check enabled on the main thread: the user may hit Stop between this
+            // post and its execution, and a Stop must never be followed by an overlay.
+            mainHandler.post { if (isEnabled(appCtx)) OverlayManager.show(appCtx, uri) }
         }
     }
 
@@ -343,17 +407,19 @@ object ScreenshotWatcher {
 class ScreenshotJobService : JobService() {
 
     override fun onStartJob(params: JobParameters): Boolean {
-        // Content-trigger jobs are one-shot. Re-arm immediately so changes that land
-        // while we process this batch aren't missed. The re-armed trigger only fires
-        // on NEW changes, so this does not loop on the change that woke us.
-        ScreenshotWatcher.rearm(applicationContext)
+        // Content-trigger jobs are one-shot. Arm the OTHER job id before processing so
+        // a trigger stays registered for changes that land during this batch. Never the
+        // same id: schedule() on a currently-running job's id STOPS that job (SDK doc).
+        ScreenshotWatcher.armNext(applicationContext, params.jobId)
         ScreenshotWatcher.onJobFired(applicationContext, params) {
             jobFinished(params, false)
         }
         return true // work continues on a background thread
     }
 
-    // We already re-armed in onStartJob; nothing to reschedule here.
+    // A system-initiated stop (timeout etc.) can't kill the watcher: the next trigger
+    // was already armed in onStartJob, and the in-flight batch finishes on our own
+    // HandlerThread regardless. Nothing to reschedule.
     override fun onStopJob(params: JobParameters): Boolean = false
 }
 
